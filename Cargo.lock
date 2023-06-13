@@ -171,7 +171,6 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "log",
- "once_cell",
  "orderbook_aggregator_common",
  "serde",
  "serde_json",

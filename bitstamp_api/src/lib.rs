@@ -4,15 +4,15 @@ use crate::types::BitstampMessage;
 use async_trait::async_trait;
 use futures_channel::mpsc::UnboundedSender;
 use orderbook_aggregator_common::errors::{KeyrockError, Result};
-use orderbook_aggregator_common::types::OrderBook;
-use orderbook_aggregator_common::ws::{Command, DataMessageType, ExchangeWebSocketApi};
-use std::collections::HashMap;
+use orderbook_aggregator_common::ws::{
+    Command, DataMessageType, ExchangeWebSocketApi, OrderbookSubscriptions,
+};
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, RwLock};
-use tokio::sync::broadcast::Sender;
 use url::Url;
 
-///https://www.bitstamp.net/websocket/v2/
+/// <https://www.bitstamp.net/websocket/v2/>
+/// Maximum connection age is 90 days from the time the connection is established.
 
 pub const DEFAULT_BITSTAMP_WS_URL: &str = "wss://ws.bitstamp.net/";
 pub const BITSTAMP_EXCHANGE_NAME: &str = "bitstamp";
@@ -20,7 +20,7 @@ pub const BITSTAMP_EXCHANGE_NAME: &str = "bitstamp";
 pub struct BitstampWebSocketApi {
     connection_url: Url,
     command_in_tx: UnboundedSender<Command>,
-    orderbook_subscriptions: Arc<RwLock<HashMap<String, Sender<OrderBook>>>>,
+    orderbook_subscriptions: OrderbookSubscriptions,
 }
 
 impl Display for BitstampWebSocketApi {
@@ -34,7 +34,8 @@ impl ExchangeWebSocketApi for BitstampWebSocketApi {
     fn new(
         url: Url,
         command_in_tx: UnboundedSender<Command>,
-        orderbook_subscriptions: Arc<RwLock<HashMap<String, Sender<OrderBook>>>>,
+        orderbook_subscriptions: OrderbookSubscriptions,
+        _is_disconnected: Arc<RwLock<bool>>,
     ) -> Self {
         Self {
             connection_url: url,
@@ -54,7 +55,7 @@ impl ExchangeWebSocketApi for BitstampWebSocketApi {
     }
 
     #[inline]
-    fn orderbook_subscriptions(&self) -> &Arc<RwLock<HashMap<String, Sender<OrderBook>>>> {
+    fn orderbook_subscriptions(&self) -> &OrderbookSubscriptions {
         &self.orderbook_subscriptions
     }
 
@@ -67,15 +68,18 @@ impl ExchangeWebSocketApi for BitstampWebSocketApi {
     }
 
     fn create_unsubscribe_message(channel: &str) -> Result<String> {
-        let msg = BitstampMessage::unsubscribe(&channel);
+        let msg = BitstampMessage::unsubscribe(channel);
         match serde_json::to_string(&msg) {
             Ok(s) => Ok(s),
             Err(e) => Err(KeyrockError::SerDeError(e)),
         }
     }
 
-    async fn process_message(msg: &str) -> Result<DataMessageType> {
-        match serde_json::from_str::<BitstampMessage>(&msg) {
+    async fn process_message(
+        msg: &str,
+        _orderbook_subscriptions: &OrderbookSubscriptions,
+    ) -> Result<DataMessageType> {
+        match serde_json::from_str::<BitstampMessage>(msg) {
             Ok(mut bs_msg) => {
                 let channel = bs_msg
                     .channel
@@ -86,7 +90,10 @@ impl ExchangeWebSocketApi for BitstampWebSocketApi {
                         Ok(DataMessageType::SubscribeSuccessful(channel))
                     }
                     "bts:unsubscription_succeeded" => {
-                        Ok(DataMessageType::UnsubscribeSuccessful(channel))
+                        Ok(DataMessageType::UnsubscribeSuccessful(Some(channel)))
+                    }
+                    "bts:request_reconnect" => {
+                        todo!()
                     }
                     "data" => {
                         if channel.starts_with("order_book_") {
@@ -115,11 +122,14 @@ impl ExchangeWebSocketApi for BitstampWebSocketApi {
         }
     }
 
-    fn check_depth(depth: usize) -> Result<()> {
+    fn check_orderbook_subscription_params(&self, _symbol: &str, depth: usize) -> Result<()> {
         if depth > 0 && depth <= 100 {
             Ok(())
         } else {
-            Err(KeyrockError::BadArgument(format!("Bitstamp ")))
+            Err(KeyrockError::BadArgument(format!(
+                "Bad depth parameter for Bitstamp {}, supports depth levels between 1 & 100",
+                depth
+            )))
         }
     }
 
@@ -138,6 +148,7 @@ impl ExchangeWebSocketApi for BitstampWebSocketApi {
 mod tests {
     use crate::ExchangeWebSocketApi;
     use env_logger::Builder;
+    use orderbook_aggregator_common::types::OrderBook;
     use std::time::Duration;
     use tokio::time::sleep;
 
@@ -151,7 +162,7 @@ mod tests {
 
         let mut bitstamp_api = BitstampWebSocketApi::connect_default().await.unwrap();
         let mut rx = bitstamp_api
-            .subscribe_order_book("BTCUSDT", 10)
+            .subscribe_orderbook("BTCUSDT", 10)
             .await
             .unwrap();
 
@@ -174,9 +185,12 @@ mod tests {
         drop(rx);
 
         //Check for unsubscribe
-        sleep(Duration::from_secs(10)).await;
+        sleep(Duration::from_secs(50)).await;
 
         bitstamp_api.disconnect().await.unwrap();
+
+        //Check for close handling
+        sleep(Duration::from_secs(5)).await;
 
         log::info!("Done");
     }

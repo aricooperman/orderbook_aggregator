@@ -12,7 +12,6 @@ pub struct OrderBook {
     pub asks: Vec<OrderBookLevel>,
 }
 
-/// A position represents an unfilled order that is kept in the system for later filling.
 #[derive(Clone, Debug, Eq, Serialize, Deserialize)]
 pub struct OrderBookLevel {
     #[serde(skip)]
@@ -79,19 +78,6 @@ impl TryFrom<&Value> for OrderBookLevel {
     }
 }
 
-///
-///
-/// # Arguments
-///
-/// * `deserializer`:
-///
-/// returns: Result<Decimal, <D as Deserializer>::Error>
-///
-/// # Examples
-///
-/// ```
-///
-/// ```
 pub fn decimal_from_str<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Decimal, D::Error> {
     Ok(match Value::deserialize(deserializer)? {
         Value::String(s) => Decimal::from_str(s.as_str()).map_err(de::Error::custom)?,

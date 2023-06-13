@@ -58,33 +58,36 @@ async fn main() -> Result<()> {
 
     let mut bitstamp_api = BitstampWebSocketApi::connect_default().await.unwrap();
     let bitstamp_feed: tokio::sync::broadcast::Receiver<OrderBook> = bitstamp_api
-        .subscribe_order_book(&opts.symbol, opts.depth)
+        .subscribe_orderbook(&opts.symbol, opts.depth)
         .await
         .unwrap();
 
     let mut binance_api = BinanceWebSocketApi::connect_default().await.unwrap();
     let binance_feed: tokio::sync::broadcast::Receiver<OrderBook> = binance_api
-        .subscribe_order_book(&opts.symbol, opts.depth)
+        .subscribe_orderbook(&opts.symbol, opts.depth)
         .await
         .unwrap();
 
     let (tx, rx) = mpsc::channel::<Summary>(128);
     let (exch_ob_tx, exch_ob_rx) = mpsc::channel::<ExchangeOrderBook>(128);
 
-    let depth = opts.depth as usize;
     let addr = opts.listen_at.parse().unwrap();
     let orderbook_service = OrderbookAggregatorService::new(rx);
     let svc = OrderbookAggregatorServer::new(orderbook_service);
 
-    tokio::spawn(outgoing_summary_loop(depth, tx, exch_ob_rx));
+    tokio::spawn(outgoing_summary_loop(opts.depth, tx, exch_ob_rx));
 
     tokio::spawn(incoming_bitstamp_feed_loop(
-        depth,
+        opts.depth,
         bitstamp_feed,
         exch_ob_tx.clone(),
     ));
 
-    tokio::spawn(incoming_binance_feed_loop(depth, binance_feed, exch_ob_tx));
+    tokio::spawn(incoming_binance_feed_loop(
+        opts.depth,
+        binance_feed,
+        exch_ob_tx,
+    ));
 
     Server::builder()
         .add_service(svc)
@@ -92,7 +95,7 @@ async fn main() -> Result<()> {
         .await
         .unwrap();
 
-    let _ = binance_api.disconnect();
+    let _ = binance_api.disconnect().await;
 
     Ok(())
 }
@@ -178,20 +181,20 @@ async fn outgoing_summary_loop(
                     .into_iter()
                     .rev()
                     .take(depth)
-                    .map(|obl| Level::from(obl))
+                    .map(Level::from)
                     .collect();
                 let asks: Vec<Level> = aggregate_asks
                     .into_iter()
                     .take(depth)
-                    .map(|obl| Level::from(obl))
+                    .map(Level::from)
                     .collect();
-                let spread = if bids.len() > 0 && asks.len() > 0 {
+                let spread = if !bids.is_empty() && !asks.is_empty() {
                     asks.first().unwrap().price - bids.first().unwrap().price
                 } else {
                     f64::NAN
                 };
 
-                if let Err(_) = summary_out_tx.send(Summary { spread, bids, asks }).await {
+                if (summary_out_tx.send(Summary { spread, bids, asks }).await).is_err() {
                     log::debug!(
                         "Service is no longer listening to consolidated order book updates"
                     );
@@ -213,15 +216,15 @@ fn add_to_aggregate_half_orderbook(
     cutoff_price_fn: PriceCutoffFunc,
     should_skip_level_fn: ShouldSkipLevelFunc,
 ) {
-    let max_level = get_max_level_across_exchanges(&exch_half_orderbooks);
+    let max_level = get_max_level_across_exchanges(exch_half_orderbooks);
     for level_idx in 0..max_level {
         let cutoff_price = cutoff_price_fn(depth, aggregate_half_orderbook);
-        for exch_idx in 0..NUMBER_OF_EXCHANGES {
-            if exch_half_orderbooks[exch_idx].len() <= level_idx {
+        for exch_half_orderbook in exch_half_orderbooks.iter() {
+            if exch_half_orderbook.len() <= level_idx {
                 continue;
             }
 
-            let level = &(exch_half_orderbooks[exch_idx])[level_idx];
+            let level = &(exch_half_orderbook)[level_idx];
             if should_skip_level_fn(&level.price, &cutoff_price) {
                 continue;
             }
@@ -252,13 +255,14 @@ async fn incoming_bitstamp_feed_loop(
                     || check_half_book_changed_and_update(depth, &mut last_asks, &orderbook.asks)
                 {
                     //Something changed
-                    if let Err(_) = exch_ob_tx
+                    if (exch_ob_tx
                         .send(ExchangeOrderBook {
                             exchange: BITSTAMP_EXCHANGE_NAME,
                             bids: orderbook.bids,
                             asks: orderbook.asks,
                         })
-                        .await
+                        .await)
+                        .is_err()
                     {
                         log::debug!("No more listeners to Bitstamp orderbook updates");
                         break;
@@ -290,13 +294,14 @@ async fn incoming_binance_feed_loop(
                     || check_half_book_changed_and_update(depth, &mut last_asks, &orderbook.asks)
                 {
                     //Something changed
-                    if let Err(_) = exch_ob_tx
+                    if (exch_ob_tx
                         .send(ExchangeOrderBook {
                             exchange: BINANCE_EXCHANGE_NAME,
                             bids: orderbook.bids,
                             asks: orderbook.asks,
                         })
-                        .await
+                        .await)
+                        .is_err()
                     {
                         log::debug!("No more listeners to Binance orderbook updates");
                         break;
@@ -314,11 +319,11 @@ async fn incoming_binance_feed_loop(
 fn check_half_book_changed_and_update(
     depth: usize,
     half_book_orig: &mut Cell<Vec<OrderBookLevel>>,
-    half_book_new: &Vec<OrderBookLevel>,
+    half_book_new: &[OrderBookLevel],
 ) -> bool {
     let orig = half_book_orig.get_mut();
-    if orig.len() < depth || half_book_changed(orig, &half_book_new) {
-        half_book_orig.replace(half_book_new.clone());
+    if orig.len() < depth || half_book_changed(orig, half_book_new) {
+        half_book_orig.replace(half_book_new.to_vec());
         true
     } else {
         false
@@ -326,7 +331,7 @@ fn check_half_book_changed_and_update(
 }
 
 //TODO test
-fn half_book_changed(book_one: &Vec<OrderBookLevel>, book_two: &Vec<OrderBookLevel>) -> bool {
+fn half_book_changed(book_one: &[OrderBookLevel], book_two: &[OrderBookLevel]) -> bool {
     !book_one
         .iter()
         .zip(book_two.iter())
