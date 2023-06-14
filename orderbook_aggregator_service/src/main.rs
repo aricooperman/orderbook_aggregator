@@ -277,7 +277,7 @@ async fn incoming_bitstamp_feed_loop(
     }
 }
 
-//TODO refactor this with bitstamp version and genericize
+//TODO refactor this with bitstamp version and generalize
 async fn incoming_binance_feed_loop(
     depth: usize,
     mut orderbook_rx: tokio::sync::broadcast::Receiver<OrderBook>,

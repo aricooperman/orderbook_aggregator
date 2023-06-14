@@ -495,10 +495,7 @@ pub trait ExchangeWebSocketApi: Sized + Display + 'static {
                             break;
                         }
                         Err(e) => {
-                            match e {
-                                Error::AlreadyClosed => {} //TODO for now ignore, need a check if we need to reconnect
-                                _ => log::error!("Unable to send close message: {:?}", e),
-                            }
+                            log::error!("Unable to send close message: {:?}", e)
                         }
                     }
 

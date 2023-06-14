@@ -173,7 +173,7 @@ mod tests {
 
                     // if i == 3 {
                     //     // Force close to check reconnection logic
-                    //     bitstamp_api.command_in_tx.send(Command::Send(Message::Close(None))).expect("TODO: panic message");
+                    //     bitstamp_api.command_in_tx.send(Command::Send(Message::Close(None))).expect("panic message");
                     // }
                 }
                 Err(e) => {
