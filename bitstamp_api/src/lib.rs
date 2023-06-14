@@ -2,13 +2,12 @@ mod types;
 
 use crate::types::BitstampMessage;
 use async_trait::async_trait;
-use futures_channel::mpsc::UnboundedSender;
 use orderbook_aggregator_common::errors::{KeyrockError, Result};
 use orderbook_aggregator_common::ws::{
     Command, DataMessageType, ExchangeWebSocketApi, OrderbookSubscriptions,
 };
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, RwLock};
+use tokio::sync::broadcast::Sender;
 use url::Url;
 
 /// <https://www.bitstamp.net/websocket/v2/>
@@ -19,7 +18,7 @@ pub const BITSTAMP_EXCHANGE_NAME: &str = "bitstamp";
 
 pub struct BitstampWebSocketApi {
     connection_url: Url,
-    command_in_tx: UnboundedSender<Command>,
+    command_in_tx: Sender<Command>,
     orderbook_subscriptions: OrderbookSubscriptions,
 }
 
@@ -33,9 +32,8 @@ impl Display for BitstampWebSocketApi {
 impl ExchangeWebSocketApi for BitstampWebSocketApi {
     fn new(
         url: Url,
-        command_in_tx: UnboundedSender<Command>,
+        command_in_tx: Sender<Command>,
         orderbook_subscriptions: OrderbookSubscriptions,
-        _is_disconnected: Arc<RwLock<bool>>,
     ) -> Self {
         Self {
             connection_url: url,
@@ -50,7 +48,7 @@ impl ExchangeWebSocketApi for BitstampWebSocketApi {
     }
 
     #[inline]
-    fn command_in_tx(&self) -> &UnboundedSender<Command> {
+    fn command_in_tx(&self) -> &Sender<Command> {
         &self.command_in_tx
     }
 
@@ -75,7 +73,7 @@ impl ExchangeWebSocketApi for BitstampWebSocketApi {
         }
     }
 
-    async fn process_message(
+    fn process_message(
         msg: &str,
         _orderbook_subscriptions: &OrderbookSubscriptions,
     ) -> Result<DataMessageType> {
@@ -92,9 +90,7 @@ impl ExchangeWebSocketApi for BitstampWebSocketApi {
                     "bts:unsubscription_succeeded" => {
                         Ok(DataMessageType::UnsubscribeSuccessful(Some(channel)))
                     }
-                    "bts:request_reconnect" => {
-                        todo!()
-                    }
+                    "bts:request_reconnect" => Ok(DataMessageType::Reconnect),
                     "data" => {
                         if channel.starts_with("order_book_") {
                             Ok(DataMessageType::OrderBookData(
@@ -151,6 +147,7 @@ mod tests {
     use orderbook_aggregator_common::types::OrderBook;
     use std::time::Duration;
     use tokio::time::sleep;
+    // use tokio_tungstenite::tungstenite::Message;
 
     use super::*;
 
@@ -161,17 +158,23 @@ mod tests {
             .init();
 
         let mut bitstamp_api = BitstampWebSocketApi::connect_default().await.unwrap();
+        let count = 10;
         let mut rx = bitstamp_api
             .subscribe_orderbook("BTCUSDT", 10)
             .await
-            .unwrap();
+            .expect("Successful subscription");
 
         let mut msgs: Vec<OrderBook> = vec![];
-        for i in 0..10 {
+        for i in 0..count {
             match rx.recv().await {
                 Ok(obm) => {
                     log::info!("{}: {:?}", i, obm);
                     msgs.push(obm);
+
+                    // if i == 3 {
+                    //     // Force close to check reconnection logic
+                    //     bitstamp_api.command_in_tx.send(Command::Send(Message::Close(None))).expect("TODO: panic message");
+                    // }
                 }
                 Err(e) => {
                     log::error!("Got channel receive error: {:?}", e);
@@ -180,12 +183,12 @@ mod tests {
             }
         }
 
-        assert_eq!(msgs.len(), 10);
+        assert_eq!(msgs.len(), count);
 
         drop(rx);
 
         //Check for unsubscribe
-        sleep(Duration::from_secs(50)).await;
+        sleep(Duration::from_secs(360)).await;
 
         bitstamp_api.disconnect().await.unwrap();
 

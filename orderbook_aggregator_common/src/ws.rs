@@ -2,21 +2,22 @@ use crate::errors::{KeyrockError, Result};
 use crate::try_values_to_orderbook;
 use crate::types::OrderBook;
 use async_trait::async_trait;
-use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::thread::sleep;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::time;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, tungstenite, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::tungstenite::{Error, Message};
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use url::Url;
 
+#[derive(Clone, Debug)]
 pub enum Command {
     Send(Message),
     Subscribe(String),
@@ -25,11 +26,13 @@ pub enum Command {
     Ping,
 }
 
+#[derive(Clone, Debug)]
 pub enum DataMessageType {
     SubscribeSuccessful(String),
     UnsubscribeSuccessful(Option<String>),
     OrderBookData(String, Value, Value),
     // Future other types
+    Reconnect,
 }
 
 pub type OrderbookSubscriptions = Arc<RwLock<HashMap<String, Sender<OrderBook>>>>;
@@ -38,9 +41,8 @@ pub type OrderbookSubscriptions = Arc<RwLock<HashMap<String, Sender<OrderBook>>>
 pub trait ExchangeWebSocketApi: Sized + Display + 'static {
     fn new(
         url: Url,
-        command_in_tx: UnboundedSender<Command>,
+        command_in_tx: Sender<Command>,
         orderbook_subscriptions: OrderbookSubscriptions,
-        is_disconnected: Arc<RwLock<bool>>,
     ) -> Self;
 
     fn default_url() -> &'static str;
@@ -52,40 +54,113 @@ pub trait ExchangeWebSocketApi: Sized + Display + 'static {
     async fn connect(conn_url: &str) -> Result<Self> {
         let url = Url::parse(conn_url)?; //Check if valid url
 
-        let websocket = match connect_async(&url).await {
-            Ok((websocket, _)) => {
-                log::info!("Connected to {} WebSocket API", Self::exchange_name());
-                websocket
-            }
-            Err(e) => return Err(KeyrockError::ConnectionError(Box::new(e))),
-        };
-
-        let (command_in_tx, command_in_rx) = futures_channel::mpsc::unbounded::<Command>();
-        let (websocket_sink, websocket_stream) = websocket.split();
-
+        let (command_in_tx, _) = tokio::sync::broadcast::channel::<Command>(128);
         let orderbook_subscriptions = Arc::new(RwLock::new(HashMap::new()));
 
         let disconnect_flag = Arc::new(RwLock::new(false));
 
-        tokio::spawn(Self::websocket_incoming_loop(
-            websocket_stream,
+        let api = Self::new(
+            url.clone(),
             command_in_tx.clone(),
             Arc::clone(&orderbook_subscriptions),
-        ));
+        );
 
-        tokio::spawn(Self::command_incoming_loop(
-            command_in_rx,
-            websocket_sink,
-            Arc::clone(&orderbook_subscriptions),
-            Arc::clone(&disconnect_flag),
-        ));
+        let start_cond = Arc::new((Mutex::new(false), Condvar::new()));
+        let start_cond_loop = Arc::clone(&start_cond);
 
-        Ok(Self::new(
-            url,
-            command_in_tx,
-            orderbook_subscriptions,
-            disconnect_flag,
-        ))
+        tokio::spawn(async move {
+            loop {
+                let websocket = match connect_async(&url).await {
+                    Ok((websocket, _)) => {
+                        log::info!("Connected to {} WebSocket API", Self::exchange_name());
+                        websocket
+                    }
+                    Err(e) => {
+                        log::error!("{}", e);
+                        sleep(Duration::from_secs(5));
+                        log::info!("Retrying connection");
+                        continue;
+                    }
+                };
+
+                let (websocket_sink, websocket_stream) = websocket.split();
+
+                let ws_loop_jh = tokio::spawn(Self::websocket_incoming_loop(
+                    websocket_stream,
+                    command_in_tx.clone(),
+                    Arc::clone(&orderbook_subscriptions),
+                ));
+
+                let cmd_loop_jh = tokio::spawn(Self::command_incoming_loop(
+                    command_in_tx.subscribe(),
+                    websocket_sink,
+                    Arc::clone(&orderbook_subscriptions),
+                    Arc::clone(&disconnect_flag),
+                ));
+
+                match orderbook_subscriptions.read() {
+                    Ok(subs) => {
+                        for channel in subs.keys() {
+                            if let Err(e) = command_in_tx.send(Command::Subscribe(channel.clone()))
+                            {
+                                log::error!("Unable to send subscribe message for api {} on channel {}: {:?}", Self::exchange_name(),
+                                            channel, e)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to acquire read lock on orderbook subscriptions: {:?}",
+                            e
+                        );
+                    }
+                }
+
+                let (lock, cvar) = &*start_cond_loop;
+                match lock.lock() {
+                    Ok(mut started) => {
+                        *started = true;
+                        cvar.notify_one()
+                    }
+                    Err(e) => {
+                        log::error!("{}", e);
+                        cmd_loop_jh.abort();
+                        ws_loop_jh.abort();
+                        continue;
+                    }
+                }
+
+                tokio::select! {
+                    _ = ws_loop_jh => {}
+                    _ = cmd_loop_jh => {}
+                }
+
+                match disconnect_flag.read() {
+                    Ok(flag) => {
+                        if *flag {
+                            log::debug!("Connection disconnected, stopping main connection loop");
+                            break;
+                        } else {
+                            log::info!("Connection disconnected, reconnecting main connection loop in 5 seconds");
+                            sleep(Duration::from_secs(5));
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Unable to acquire read lock on disconnect flag in main connection loop: {:?}", e);
+                        continue;
+                    }
+                }
+            }
+        });
+
+        let (lock, cvar) = &*start_cond;
+        let mut started = lock.lock()?;
+        while !*started {
+            started = cvar.wait(started)?;
+        }
+
+        Ok(api)
     }
 
     async fn subscribe_orderbook(
@@ -101,7 +176,7 @@ pub trait ExchangeWebSocketApi: Sized + Display + 'static {
             None => {
                 if let Err(e) = self
                     .command_in_tx()
-                    .unbounded_send(Command::Subscribe(channel.clone()))
+                    .send(Command::Subscribe(channel.clone()))
                 {
                     return Err(KeyrockError::WebSocketSendError(
                         format!(
@@ -123,17 +198,13 @@ pub trait ExchangeWebSocketApi: Sized + Display + 'static {
     }
 
     async fn disconnect(&mut self) -> Result<()> {
-        match self.command_in_tx().unbounded_send(Command::Disconnect) {
+        match self.command_in_tx().send(Command::Disconnect) {
             Ok(_) => Ok(()),
-            Err(e) => Err(KeyrockError::DisconnectionError(Box::new(e))),
+            Err(e) => Err(KeyrockError::DisconnectionError(format!("{}", e))),
         }
     }
 
-    // fn is_disconnected(&self) -> bool;
-
-    // fn set_disconnected(&mut self);
-
-    fn command_in_tx(&self) -> &UnboundedSender<Command>;
+    fn command_in_tx(&self) -> &Sender<Command>;
 
     //TODO Other subscriber types - use map from subscription type -> subscription -> subscribers
     fn orderbook_subscriptions(&self) -> &OrderbookSubscriptions;
@@ -143,7 +214,7 @@ pub trait ExchangeWebSocketApi: Sized + Display + 'static {
     fn create_unsubscribe_message(channel: &str) -> Result<String>;
 
     fn unsubscribe_channel(
-        command_in_tx: &UnboundedSender<Command>,
+        command_in_tx: &Sender<Command>,
         channel: &str,
         orderbook_subscriptions: &OrderbookSubscriptions,
     ) {
@@ -159,15 +230,14 @@ pub trait ExchangeWebSocketApi: Sized + Display + 'static {
             ),
         }
 
-        if !command_in_tx.is_closed() {
-            if let Err(e) = command_in_tx.unbounded_send(Command::Unsubscribe(channel.to_string()))
-            {
+        if command_in_tx.receiver_count() > 0 {
+            if let Err(e) = command_in_tx.send(Command::Unsubscribe(channel.to_string())) {
                 log::error!("Unable to send unsubscribe command to channel: {:?}", e)
             }
         }
     }
 
-    async fn process_message(
+    fn process_message(
         msg: &str,
         orderbook_subscriptions: &OrderbookSubscriptions,
     ) -> Result<DataMessageType>;
@@ -179,7 +249,7 @@ pub trait ExchangeWebSocketApi: Sized + Display + 'static {
     fn exchange_name() -> &'static str;
 
     fn handle_orderbook_data(
-        command_in_tx: &UnboundedSender<Command>,
+        command_in_tx: &Sender<Command>,
         orderbook_subscriptions: &OrderbookSubscriptions,
         bids: &Value,
         asks: &Value,
@@ -242,89 +312,120 @@ pub trait ExchangeWebSocketApi: Sized + Display + 'static {
 
     async fn websocket_incoming_loop(
         mut websocket_stream: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-        command_in_tx: UnboundedSender<Command>,
+        command_in_tx: Sender<Command>,
         orderbook_subscriptions: OrderbookSubscriptions,
     ) {
         loop {
-            match websocket_stream.next().await {
-                None => {
-                    log::debug!("No more incoming messages from websocket");
-                    break;
-                }
-                Some(message_result) => match message_result {
-                    Ok(message) => match message {
-                        Message::Text(msg) => {
-                            match Self::process_message(&msg, &orderbook_subscriptions).await {
-                                Ok(msg_type) => match msg_type {
-                                    DataMessageType::SubscribeSuccessful(channel) => {
-                                        log::info!("Subscribed to {}", channel)
+            // We should get at a minimum a pong message within 2 minutes, if not something is wrong with the connection
+            let message =
+                match time::timeout(Duration::from_secs(2 * 60), websocket_stream.next()).await {
+                    Ok(opt_msg) => {
+                        match opt_msg {
+                            None => {
+                                // WS connection is closed. Break loop and let reconnect logic determine
+                                // if a reconnect attempt should be made
+                                log::debug!("No more incoming messages from websocket");
+                                drop(websocket_stream);
+                                drop(command_in_tx);
+                                break;
+                            }
+                            Some(msg_res) => {
+                                match msg_res {
+                                    Ok(message) => message,
+                                    Err(e) => {
+                                        log::error!("Error retrieving next message: {:?}", e);
+                                        // Attempt reconnection in case there is an issue as this should
+                                        // not happen
+                                        break;
                                     }
-                                    DataMessageType::UnsubscribeSuccessful(channel) => {
-                                        match channel {
-                                            None => log::info!("Unsubscribed"),
-                                            Some(channel) => {
-                                                log::info!("Unsubscribed to {}", channel)
-                                            }
-                                        }
-                                    }
-                                    DataMessageType::OrderBookData(channel, bids, asks) => {
-                                        Self::handle_orderbook_data(
-                                            &command_in_tx,
-                                            &orderbook_subscriptions,
-                                            &bids,
-                                            &asks,
-                                            &channel,
-                                        )
-                                    }
-                                },
-                                Err(e) => {
-                                    log::error!("Problem occurred processing message: {:?}", e)
                                 }
                             }
                         }
-                        Message::Ping(data) => {
-                            log::debug!("Received Ping message, sending Pong");
-                            if let Err(e) =
-                                command_in_tx.unbounded_send(Command::Send(Message::Pong(data)))
-                            {
-                                log::error!("Failed to send pong message: {:?}", e);
-                            }
-                        }
-                        Message::Pong(_) => {
-                            log::debug!("Received a pong message");
-                        }
-                        //TODO handle 24 hour or other closure unrequested
-                        Message::Close(_) => {
-                            log::debug!("Received close message");
-                            //TODO reconnect logic
-                        }
-                        _ => {
-                            log::error!("Unhandled message type: {:?}", message);
-                        }
-                    },
-                    Err(e) => {
-                        log::error!("Error retrieving next message: {:?}", e)
                     }
-                },
+                    Err(_elapsed) => {
+                        // Haven't received a message in too long, connection maybe dropped on exchange
+                        // end, try to reconnect by breaking loop
+                        log::debug!("WS incoming stream timed out");
+                        break;
+                    }
+                };
+
+            match message {
+                Message::Text(msg) => {
+                    match Self::process_message(&msg, &orderbook_subscriptions) {
+                        Ok(msg_type) => match msg_type {
+                            DataMessageType::SubscribeSuccessful(channel) => {
+                                log::info!("Subscribed to {}", channel)
+                            }
+                            DataMessageType::UnsubscribeSuccessful(channel) => match channel {
+                                None => log::info!("Unsubscribed"),
+                                Some(channel) => {
+                                    log::info!("Unsubscribed to {}", channel)
+                                }
+                            },
+                            DataMessageType::OrderBookData(channel, bids, asks) => {
+                                Self::handle_orderbook_data(
+                                    &command_in_tx,
+                                    &orderbook_subscriptions,
+                                    &bids,
+                                    &asks,
+                                    &channel,
+                                )
+                            }
+                            DataMessageType::Reconnect => {
+                                //Simply break loop without flagging disconnect and it will reconnect
+                                break;
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("Problem occurred processing message: {:?}", e)
+                        }
+                    }
+                }
+                Message::Ping(data) => {
+                    log::debug!("Received Ping message, sending Pong");
+                    if let Err(e) = command_in_tx.send(Command::Send(Message::Pong(data))) {
+                        log::error!("Failed to send pong message: {:?}", e);
+                    }
+                }
+                Message::Pong(_) => {
+                    log::debug!("Received a pong message");
+                }
+                Message::Close(_) => {
+                    log::debug!("Received close message");
+                    // Simply break loop without flagging disconnect and it will reconnect
+                    // if we did not ask for the disconnection
+                    break;
+                }
+                _ => {
+                    log::error!("Unhandled message type: {:?}", message);
+                }
             }
         }
+
+        log::debug!("websocket_incoming_loop ending");
     }
 
     async fn command_incoming_loop(
-        mut command_in_rx: UnboundedReceiver<Command>,
+        mut command_in_rx: Receiver<Command>,
         mut websocket_sink: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
         orderbook_subscriptions: OrderbookSubscriptions,
         disconnect_flag: Arc<RwLock<bool>>,
     ) {
         loop {
-            let command = match time::timeout(Duration::from_secs(15), command_in_rx.next()).await {
+            let command = match time::timeout(Duration::from_secs(60), command_in_rx.recv()).await {
                 Ok(opt_command) => match opt_command {
-                    None => break,
-                    Some(command) => command,
+                    Ok(command) => command,
+                    Err(_) => {
+                        log::debug!("No more incoming command messages for websocket");
+                        drop(command_in_rx);
+                        drop(websocket_sink);
+                        break;
+                    }
                 },
-                Err(_) => {
-                    websocket_sink.send(Message::Close(None)).await.unwrap();
-                    Command::Ping
+                Err(_elapsed) => {
+                    // Command::Ping
+                    continue;
                 }
             };
 
@@ -372,7 +473,9 @@ pub trait ExchangeWebSocketApi: Sized + Display + 'static {
                 Command::Disconnect => {
                     match disconnect_flag.write() {
                         Ok(mut flag) => *flag = true,
-                        Err(e) => log::warn!("Unable to lock for writing disconnect flag: {:?}", e),
+                        Err(e) => {
+                            log::error!("Unable to acquire write lock on disconnect flag: {:?}", e)
+                        }
                     }
 
                     match orderbook_subscriptions.write() {
@@ -388,36 +491,33 @@ pub trait ExchangeWebSocketApi: Sized + Display + 'static {
                     match websocket_sink.send(Message::Close(None)).await {
                         Ok(_) => {
                             log::info!("Disconnected from WebSocket API");
-                            command_in_rx.close();
+                            drop(command_in_rx);
                             break;
                         }
                         Err(e) => {
                             match e {
-                                tungstenite::error::Error::AlreadyClosed => {} //TODO for now ignore, need a check if we need to reconnect
+                                Error::AlreadyClosed => {} //TODO for now ignore, need a check if we need to reconnect
                                 _ => log::error!("Unable to send close message: {:?}", e),
                             }
                         }
                     }
 
                     let _ = websocket_sink.close().await;
+                    break;
                 }
                 Command::Send(msg) => {
                     if let Err(e) = websocket_sink.send(msg).await {
-                        match e {
-                            tungstenite::error::Error::AlreadyClosed => {} //TODO for now ignore, need a check if we need to reconnect
-                            _ => log::warn!("Unable to send message: {:?}", e),
-                        }
+                        log::warn!("Unable to send message: {:?}", e)
                     }
                 }
                 Command::Ping => {
                     if let Err(e) = websocket_sink.send(Message::Ping(vec![])).await {
-                        match e {
-                            tungstenite::error::Error::AlreadyClosed => {} //TODO for now ignore, need a check if we need to reconnect
-                            _ => log::warn!("Unable to send ping message: {:?}", e),
-                        }
+                        log::warn!("Unable to send ping message: {:?}", e)
                     }
                 }
             }
         }
+
+        log::debug!("command_incoming_loop ending");
     }
 }

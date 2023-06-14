@@ -7,10 +7,10 @@ pub type Result<T> = std::result::Result<T, KeyrockError>;
 #[derive(thiserror::Error, Debug)]
 pub enum KeyrockError {
     #[error("Unable to make a connection: {0}")]
-    ConnectionError(#[source] Box<dyn Error>),
+    ConnectionError(String),
 
     #[error("Unable to make a connection: {0}")]
-    DisconnectionError(#[source] Box<dyn Error>),
+    DisconnectionError(String),
 
     #[error("I/O error occurred: {0}")]
     IoError(#[from] std::io::Error),
@@ -45,6 +45,8 @@ impl<T> From<PoisonError<T>> for KeyrockError {
         Self::RwLockingError(format!("Unable to acquire RW lock: {:?}", value))
     }
 }
+
+unsafe impl Send for KeyrockError {}
 
 // #[cfg(test)]
 // mod tests {
