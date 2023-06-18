@@ -1,21 +1,28 @@
-mod types;
+use std::fmt::{Display, Formatter};
 
-use crate::types::BitstampMessage;
 use async_trait::async_trait;
+use tokio::sync::broadcast::Sender;
+use url::Url;
+
 use orderbook_aggregator_common::errors::{KeyrockError, Result};
 use orderbook_aggregator_common::ws::{
     Command, DataMessageType, ExchangeWebSocketApi, OrderbookSubscriptions,
 };
-use std::fmt::{Display, Formatter};
-use tokio::sync::broadcast::Sender;
-use url::Url;
 
-/// <https://www.bitstamp.net/websocket/v2/>
-/// Maximum connection age is 90 days from the time the connection is established.
+use crate::types::BitstampMessage;
 
+mod types;
+
+/// The default websocket api url
 pub const DEFAULT_BITSTAMP_WS_URL: &str = "wss://ws.bitstamp.net/";
+/// The exchange indetifier
 pub const BITSTAMP_EXCHANGE_NAME: &str = "bitstamp";
 
+/// A Bitstamp instance of ExchangeWebSocketAPI
+///
+/// Documentation at <https://www.bitstamp.net/websocket/v2/>
+///
+/// Note: Maximum connection age is 90 days from the time the connection is established.
 pub struct BitstampWebSocketApi {
     connection_url: Url,
     command_in_tx: Sender<Command>,
@@ -83,7 +90,6 @@ impl ExchangeWebSocketApi for BitstampWebSocketApi {
                     .channel
                     .unwrap_or_else(|| "<unknown channel>".to_string());
                 match bs_msg.event.as_str() {
-                    // {"event":"bts:subscription_succeeded","channel":"order_book_ethbtc","data":{}}
                     "bts:subscription_succeeded" => {
                         Ok(DataMessageType::SubscribeSuccessful(channel))
                     }
@@ -92,6 +98,7 @@ impl ExchangeWebSocketApi for BitstampWebSocketApi {
                     }
                     "bts:request_reconnect" => Ok(DataMessageType::Reconnect),
                     "data" => {
+                        // Check if the incoming data is orderbook type
                         if channel.starts_with("order_book_") {
                             Ok(DataMessageType::OrderBookData(
                                 channel,
@@ -142,21 +149,37 @@ impl ExchangeWebSocketApi for BitstampWebSocketApi {
 
 #[cfg(test)]
 mod tests {
+    use tokio_tungstenite::tungstenite::Message;
+
+    use orderbook_aggregator_common::types::Orderbook;
+
     use crate::ExchangeWebSocketApi;
-    use env_logger::Builder;
-    use orderbook_aggregator_common::types::OrderBook;
-    use std::time::Duration;
-    use tokio::time::sleep;
-    // use tokio_tungstenite::tungstenite::Message;
 
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn get_order_book_updates() {
-        Builder::from_default_env()
-            .filter(None, log::LevelFilter::Debug)
-            .init();
+        let mut bitstamp_api = BitstampWebSocketApi::connect_default().await.unwrap();
+        let count = 10;
+        let mut rx = bitstamp_api
+            .subscribe_orderbook("BTCUSDT", 10)
+            .await
+            .expect("Successful subscription");
+        let mut msgs: Vec<Orderbook> = vec![];
 
+        for i in 0..count {
+            let obm = rx.recv().await.unwrap();
+            log::info!("{}: {:?}", i, obm);
+            msgs.push(obm);
+        }
+
+        bitstamp_api.disconnect().await.unwrap();
+
+        assert_eq!(msgs.len(), count);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_reconnect() {
         let mut bitstamp_api = BitstampWebSocketApi::connect_default().await.unwrap();
         let count = 10;
         let mut rx = bitstamp_api
@@ -164,17 +187,20 @@ mod tests {
             .await
             .expect("Successful subscription");
 
-        let mut msgs: Vec<OrderBook> = vec![];
+        let mut msgs: Vec<Orderbook> = vec![];
         for i in 0..count {
             match rx.recv().await {
                 Ok(obm) => {
                     log::info!("{}: {:?}", i, obm);
                     msgs.push(obm);
 
-                    // if i == 3 {
-                    //     // Force close to check reconnection logic
-                    //     bitstamp_api.command_in_tx.send(Command::Send(Message::Close(None))).expect("panic message");
-                    // }
+                    if i == 2 {
+                        // Force close to check reconnection logic
+                        bitstamp_api
+                            .command_in_tx
+                            .send(Command::Send(Message::Close(None)))
+                            .expect("DO: panic message");
+                    }
                 }
                 Err(e) => {
                     log::error!("Got channel receive error: {:?}", e);
@@ -183,18 +209,8 @@ mod tests {
             }
         }
 
-        assert_eq!(msgs.len(), count);
-
-        drop(rx);
-
-        //Check for unsubscribe
-        sleep(Duration::from_secs(360)).await;
-
         bitstamp_api.disconnect().await.unwrap();
 
-        //Check for close handling
-        sleep(Duration::from_secs(5)).await;
-
-        log::info!("Done");
+        assert_eq!(msgs.len(), count);
     }
 }

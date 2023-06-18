@@ -1,5 +1,6 @@
-use crate::orderbook::{Level, Summary};
 use std::fmt::{Display, Formatter};
+
+use crate::orderbook::{Level, Summary};
 
 impl Display for Summary {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {

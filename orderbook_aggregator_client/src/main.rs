@@ -1,12 +1,13 @@
-mod types;
-
-use crate::orderbook::orderbook_aggregator_client::OrderbookAggregatorClient;
-use crate::orderbook::Empty;
 use clap::Parser;
 use env_logger::Builder;
 use log::LevelFilter;
 use tokio_stream::StreamExt;
 use tonic::transport::Uri;
+
+use crate::orderbook::orderbook_aggregator_client::OrderbookAggregatorClient;
+use crate::orderbook::Empty;
+
+mod types;
 
 pub mod orderbook {
     tonic::include_proto!("orderbook");

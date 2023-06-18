@@ -1,9 +1,12 @@
 use std::error::Error;
 use std::sync::PoisonError;
+
 use url::ParseError;
 
+/// Type alias for typical results within the orderbook aggregator crates
 pub type Result<T> = std::result::Result<T, KeyrockError>;
 
+/// The various types of errors that may occur
 #[derive(thiserror::Error, Debug)]
 pub enum KeyrockError {
     #[error("Unable to make a connection: {0}")]
@@ -47,9 +50,3 @@ impl<T> From<PoisonError<T>> for KeyrockError {
 }
 
 unsafe impl Send for KeyrockError {}
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-// }
