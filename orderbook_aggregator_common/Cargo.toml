@@ -1,0 +1,17 @@
+[package]
+name = "orderbook_aggregator_common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log.workspace = true
+url.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rust_decimal.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+async-trait.workspace = true
+futures-channel.workspace = true
+futures-util.workspace = true
+thiserror = "1.0"
